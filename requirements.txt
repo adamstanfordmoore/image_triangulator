@@ -1,5 +1,7 @@
 Pillow
 matplotlib
+folium
+opencv-python
 exifread
 piexif
 pyheif

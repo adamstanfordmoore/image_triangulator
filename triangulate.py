@@ -5,13 +5,16 @@ triangulate.py — main entry point for triangulator.
 Estimate the real-world location of an object visible in two or more iPhone
 photos using GPS position and compass heading from EXIF metadata.
 
-Requires exiftool on PATH and: pip install Pillow matplotlib folium
+Requires exiftool on PATH and: pip install Pillow matplotlib folium opencv-python
 
 Usage:
+    # Manual — click the target in each image window
     python3 triangulate.py <image1> <image2> [image3 ...]
 
-Each image opens in a window. Click the target object, then close the window.
-Triangulation and a map are produced once all images are marked.
+    # Auto — SIFT keypoint matching finds the common point automatically
+    python3 triangulate.py --auto <image1> <image2> [image3 ...]
+
+Close each image window to confirm the selection and move to the next.
 """
 
 import math
@@ -24,24 +27,31 @@ import matplotlib.pyplot as plt
 from PIL import Image, ImageOps
 
 from geo import extract_camera, get_exif, triangulate
+from keypoint_match import match_keypoints, show_match_grid
 from map_viz import show_map
 
 
-# ── Interactive point selection ───────────────────────────────────────────────
+# ── Image loading ─────────────────────────────────────────────────────────────
+
+def load_oriented(path: str):
+    """Open an image and apply its EXIF orientation."""
+    img = Image.open(path)
+    return ImageOps.exif_transpose(img)
+
+
+# ── Manual point selection ────────────────────────────────────────────────────
 
 _MAX_DISPLAY = (1400, 900)
 
 
 def select_point(image_path: str, label: str):
     """
-    Open image_path in a matplotlib window (EXIF orientation applied).
-    User left-clicks to place a marker; right-click to clear; close to confirm.
+    Open image_path in a matplotlib window.
+    Left-click to mark the target; right-click to clear; close to confirm.
 
-    Returns (px, py, oriented_width, oriented_height) in the orientation-
-    corrected coordinate space, or (None, None, None, None) if no point chosen.
+    Returns (px, py, oriented_w, oriented_h) or (None, None, None, None).
     """
-    img = Image.open(image_path)
-    img = ImageOps.exif_transpose(img)
+    img = load_oriented(image_path)
     oriented_w, oriented_h = img.size
 
     img.thumbnail(_MAX_DISPLAY, Image.LANCZOS)
@@ -102,15 +112,10 @@ def select_point(image_path: str, label: str):
     return int(dx * scale_x), int(dy * scale_y), oriented_w, oriented_h
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Point collection strategies ───────────────────────────────────────────────
 
-def main():
-    paths = [a for a in sys.argv[1:] if Path(a).is_file()]
-    if len(paths) < 2:
-        print("Usage: triangulate.py <image1> <image2> [image3 ...]")
-        sys.exit(2)
-
-    # Step 1 — user marks the target object in each image
+def collect_manual(paths):
+    """Open each image and ask the user to click the target. Returns clicks dict."""
     clicks = {}
     for path in paths:
         name = Path(path).name
@@ -121,12 +126,65 @@ def main():
         else:
             print(f"  Selected pixel ({px}, {py})")
             clicks[path] = (px, py, ow, oh)
+    return clicks
+
+
+def collect_auto(paths):
+    """
+    Use SIFT keypoint matching to automatically find a common point across all
+    images, show the result grid, then return a clicks dict.
+
+    For any image where no match was found, falls back to manual clicking.
+    """
+    print("\nLoading images and detecting keypoints…")
+    images = [load_oriented(p) for p in paths]
+    labels = [Path(p).name for p in paths]
+
+    coords = match_keypoints(images)
+
+    # Show the matched keypoints for user confirmation
+    print("Displaying matched keypoints — close the window to continue.")
+    show_match_grid(images, coords, labels=labels)
+
+    clicks = {}
+    for path, img, coord, label in zip(paths, images, coords, labels):
+        ow, oh = img.size
+        if coord is not None:
+            px, py = coord
+            print(f"  {label}: auto ({px}, {py})")
+            clicks[path] = (px, py, ow, oh)
+        else:
+            # Fall back to manual for images with no auto match
+            print(f"\n  No auto match for {label} — opening for manual selection.")
+            px, py, ow, oh = select_point(path, label)
+            if px is not None:
+                print(f"  {label}: manual ({px}, {py})")
+                clicks[path] = (px, py, ow, oh)
+            else:
+                print(f"  Skipping {label}.")
+
+    return clicks
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+    auto_mode = "--auto" in args
+    paths = [a for a in args if a != "--auto" and Path(a).is_file()]
+
+    if len(paths) < 2:
+        print("Usage: triangulate.py [--auto] <image1> <image2> [image3 ...]")
+        sys.exit(2)
+
+    # Step 1 — collect pixel coordinates
+    clicks = collect_auto(paths) if auto_mode else collect_manual(paths)
 
     if len(clicks) < 2:
         print("\nNeed at least two marked images to triangulate.", file=sys.stderr)
         sys.exit(1)
 
-    # Step 2 — build camera records from EXIF + click coordinates
+    # Step 2 — build camera records from EXIF + pixel coordinates
     print()
     cameras = []
     for path, (px, py, ow, oh) in clicks.items():
