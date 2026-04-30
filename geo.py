@@ -8,7 +8,12 @@ import json
 import math
 import re
 import subprocess
+
+import cv2
+import numpy as np
 from pathlib import Path
+
+from calibration import get_calibration
 
 
 # ── EXIF / metadata ───────────────────────────────────────────────────────────
@@ -50,6 +55,7 @@ def extract_camera(meta: dict, px=None, py=None,
     bearing = float(meta["GPSImgDirection"])
     hfov = parse_fov(meta["FOV"])
     is_front = "Front" in meta.get("CameraType", "")
+    lens_model = meta.get("LensModel", "")
 
     width = display_width if display_width is not None else int(meta["ImageWidth"])
     height = display_height if display_height is not None else int(meta["ImageHeight"])
@@ -61,9 +67,21 @@ def extract_camera(meta: dict, px=None, py=None,
     # (Adding 180° would point toward the photographer's face, not the scene.)
 
     # Pixel offset from image centre → horizontal bearing adjustment
+    calibrated = False
     if px is not None and py is not None:
-        dx_pixels = float(px) - width / 2.0
-        bearing = (bearing + (dx_pixels / width) * hfov) % 360.0
+        K, dist = get_calibration(lens_model, width, height)
+        if K is not None:
+            # Undistort the clicked pixel; cv2.undistortPoints returns
+            # normalized image coordinates (x/fx, y/fy) with distortion removed.
+            pt = cv2.undistortPoints(
+                np.array([[[float(px), float(py)]]], dtype=np.float32), K, dist
+            )
+            xn = float(pt[0, 0, 0])
+            bearing = (bearing + math.degrees(math.atan(xn))) % 360.0
+            calibrated = True
+        else:
+            dx_pixels = float(px) - width / 2.0
+            bearing = (bearing + (dx_pixels / width) * hfov) % 360.0
 
     return {
         "file": meta.get("FileName", Path(meta.get("SourceFile", "?")).name),
@@ -74,6 +92,8 @@ def extract_camera(meta: dict, px=None, py=None,
         "width": width,
         "height": height,
         "is_front": is_front,
+        "lens_model": lens_model,
+        "calibrated": calibrated,
         "px": px,
         "py": py,
     }
@@ -96,7 +116,7 @@ def from_xy(x, y, origin_lat, origin_lon):
     return origin_lat + y / _M_PER_DEG_LAT, origin_lon + x / scale
 
 
-# ── Ray intersection ──────────────────────────────────────────────────────────
+# ── Ray / least-squares intersection ─────────────────────────────────────────
 
 def bearing_to_unit(bearing_deg):
     """Bearing (°CW from True North)  →  (dx, dy) unit vector in E/N space."""
@@ -104,77 +124,67 @@ def bearing_to_unit(bearing_deg):
     return math.sin(r), math.cos(r)
 
 
-def intersect_rays(p1, b1, p2, b2):
+def _least_squares_point(points, bearings):
     """
-    Intersect two 2-D rays in local flat-Earth coordinates.
+    Find the point P* minimising the sum of squared perpendicular distances
+    to all bearing rays (closed-form linear least squares).
 
-    p1, p2 : (x, y) origins in metres
-    b1, b2 : bearings in degrees
+    For each ray with origin p_i and unit direction d_i, the perpendicular
+    projector is A_i = I - d_i dᵢᵀ. The optimal point satisfies:
 
-    Returns (x, y, t1, t2) where t1/t2 are signed distances along each ray.
-    Negative t means the intersection is behind that camera.
-    Returns None if rays are parallel.
+        (Σ A_i) P* = Σ A_i p_i
+
+    Returns (x, y) in local metres.  Raises np.linalg.LinAlgError if the
+    system is singular (all rays parallel).
     """
-    d1x, d1y = bearing_to_unit(b1)
-    d2x, d2y = bearing_to_unit(b2)
-    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    A_sum  = np.zeros((2, 2))
+    Ap_sum = np.zeros(2)
 
-    det = d2x * d1y - d1x * d2y
-    if abs(det) < 1e-10:
-        return None
+    for (px, py), bearing in zip(points, bearings):
+        d = np.array(bearing_to_unit(bearing))
+        p = np.array([px, py])
+        A = np.eye(2) - np.outer(d, d)   # perpendicular projector
+        A_sum  += A
+        Ap_sum += A @ p
 
-    t1 = (d2x * dy - d2y * dx) / det
-    t2 = (d1x * dy - dx * d1y) / det
-    return p1[0] + t1 * d1x, p1[1] + t1 * d1y, t1, t2
+    # Use lstsq for robustness when rays are nearly parallel
+    P, _, rank, _ = np.linalg.lstsq(A_sum, Ap_sum, rcond=None)
+    if rank < 2:
+        raise np.linalg.LinAlgError("All rays are parallel — cannot triangulate.")
+    return float(P[0]), float(P[1])
 
 
 def triangulate(cameras):
     """
     Given a list of camera records (from extract_camera), return the estimated
-    target position as (lat, lon).
+    target position as (lat, lon) using closed-form least-squares minimisation
+    of perpendicular distances to all bearing rays.
 
-    For 2 cameras: exact intersection.
-    For 3+: average of all pairwise intersections (least-squares approximation).
-
-    Also returns a list of warning strings for any degenerate ray pairs.
+    Also returns a list of warning strings for cameras whose estimated point
+    falls behind them (negative along-ray distance).
     """
     origin_lat = sum(c["lat"] for c in cameras) / len(cameras)
     origin_lon = sum(c["lon"] for c in cameras) / len(cameras)
-    points = [to_xy(c["lat"], c["lon"], origin_lat, origin_lon) for c in cameras]
+    points   = [to_xy(c["lat"], c["lon"], origin_lat, origin_lon) for c in cameras]
+    bearings = [c["bearing"] for c in cameras]
 
-    hits = []
     warnings = []
-
-    for i in range(len(cameras)):
-        for j in range(i + 1, len(cameras)):
-            result = intersect_rays(
-                points[i], cameras[i]["bearing"],
-                points[j], cameras[j]["bearing"],
-            )
-            if result is None:
-                warnings.append(
-                    f"Rays from {cameras[i]['file']} and {cameras[j]['file']} "
-                    f"are parallel — skipping pair."
-                )
-                continue
-            ix, iy, t1, t2 = result
-            if t1 < 0:
-                warnings.append(
-                    f"Intersection is behind {cameras[i]['file']} "
-                    f"({t1:.0f} m) — check bearing/pixel."
-                )
-            if t2 < 0:
-                warnings.append(
-                    f"Intersection is behind {cameras[j]['file']} "
-                    f"({t2:.0f} m) — check bearing/pixel."
-                )
-            hits.append((ix, iy))
-
-    if not hits:
+    try:
+        est_x, est_y = _least_squares_point(points, bearings)
+    except np.linalg.LinAlgError as e:
+        warnings.append(str(e))
         return None, None, warnings
 
-    est_x = sum(h[0] for h in hits) / len(hits)
-    est_y = sum(h[1] for h in hits) / len(hits)
+    # Warn if the estimate is behind any camera (along-ray distance < 0)
+    for cam, (px, py) in zip(cameras, points):
+        d = np.array(bearing_to_unit(cam["bearing"]))
+        t = float(np.dot(np.array([est_x - px, est_y - py]), d))
+        if t < 0:
+            warnings.append(
+                f"Estimated point is behind {cam['file']} "
+                f"({t:.0f} m) — check bearing/pixel."
+            )
+
     est_lat, est_lon = from_xy(est_x, est_y, origin_lat, origin_lon)
     return est_lat, est_lon, warnings
 

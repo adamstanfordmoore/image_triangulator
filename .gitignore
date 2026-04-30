@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 .claude/
 memory/
+baseline.py
+GGB_images/
+calibration_images/
